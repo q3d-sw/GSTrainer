@@ -8,7 +8,7 @@
 import SwiftUI
 
 struct TrainingView: View {
-    @StateObject private var trainer = Trainer()!
+    @StateObject private var trainer = Trainer()
     @State private var selectedScale: Int = 0 // 0: original, else long-side value
     @State private var showAlert = false
     @State private var alertMessage = ""
@@ -92,6 +92,61 @@ struct TrainingView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Toggle("Overlay projections", isOn: $trainer.overlayEnabled)
                 Toggle("Geometry fine-tuning (positions)", isOn: $trainer.geoOptimizePositions)
+                // Robust loss UI
+                Toggle("Robust loss (Charbonnier)", isOn: $trainer.enableCharbonnierLoss)
+                Toggle("Screen cache (backward)", isOn: $trainer.useScreenCache)
+                Toggle("Screen cache (forward)", isOn: $trainer.useForwardCache)
+                if trainer.enableCharbonnierLoss {
+                    HStack(spacing: 12) {
+                        Text("eps")
+                            .font(.caption)
+                        Slider(value: $trainer.charbEps, in: 1e-5...5e-3, step: 1e-5) {
+                            Text("Charb eps")
+                        }
+                        Text(String(format: "%.4f", trainer.charbEps))
+                            .font(.system(size: 12, design: .monospaced))
+                            .frame(width: 56, alignment: .trailing)
+                    }
+                }
+                HStack(spacing: 12) {
+                    Text("Batch frames")
+                        .font(.caption)
+                    Stepper(value: $trainer.batchSizeFrames, in: 1...16) {
+                        Text("\(trainer.batchSizeFrames)")
+                    }
+                }
+                Divider().padding(.vertical, 4)
+                Toggle("Enable densification", isOn: $trainer.enableDensification)
+                if trainer.enableDensification {
+                    HStack {
+                        Text("Split thr")
+                            .font(.caption2)
+                        Slider(value: $trainer.splitThreshold, in: 0.01...0.5) { Text("Split thr") }
+                        Text(String(format: "%.2f", trainer.splitThreshold)).font(.caption.monospaced()).frame(width: 44)
+                    }
+                    HStack {
+                        Text("Prune op<")
+                            .font(.caption2)
+                        Slider(value: $trainer.pruneOpacityThreshold, in: 0.0...0.2) { Text("Prune") }
+                        Text(String(format: "%.2f", trainer.pruneOpacityThreshold)).font(.caption.monospaced()).frame(width: 44)
+                    }
+                    HStack {
+                        Text("Low err<")
+                            .font(.caption2)
+                        Slider(value: $trainer.lowResidualThreshold, in: 0.0...0.1) { Text("LowErr") }
+                        Text(String(format: "%.2f", trainer.lowResidualThreshold)).font(.caption.monospaced()).frame(width: 44)
+                    }
+                    HStack {
+                        Text("Interval")
+                            .font(.caption2)
+                        Stepper(value: $trainer.densifyInterval, in: 50...1000, step: 50) { Text("\(trainer.densifyInterval)") }
+                        Spacer()
+                        Button("Densify now") { trainer.performManualDensify() }
+                            .buttonStyle(.bordered)
+                    }
+                    Text("Last densify: +\(trainer.lastDensifyStats.added) / -\(trainer.lastDensifyStats.pruned)")
+                        .font(.caption.monospaced())
+                }
                 HStack {
                     Text(trainer.autoConfigSummary.isEmpty ? "Auto-configuring..." : trainer.autoConfigSummary)
                         .font(.system(size: 12, design: .monospaced))

@@ -26,14 +26,33 @@ final class Trainer: ObservableObject {
     private var bootstrapReseedDone: Bool = false
 
     // Core components
-    private var dataset: DatasetManager
-    private let renderer: MetalRenderer
-    private let device: MTLDevice
-    private var targetTexture: MTLTexture
-    private var residualTexture: MTLTexture
-    private var gaussians: [GaussianParam]
-    private var gaussianBuffer: MTLBuffer
-    private var gradBuffers: MetalRenderer.GradBuffers?
+    // Internal so validation utilities can access (was private)
+    var dataset: DatasetManager
+    let renderer: MetalRenderer
+    let device: MTLDevice
+    var targetTexture: MTLTexture
+    // Residual heatmap (downsampled) for densification planning
+    var residualHeatmapTexture: MTLTexture?
+    private var lastHeatmapBuildFrame: Int = -1
+    // Densification configuration
+    @Published var enableDensification: Bool = false
+    @Published var densifyInterval: Int = 200
+    @Published var splitThreshold: Float = 0.12
+    @Published var pruneOpacityThreshold: Float = 0.02
+    @Published var lowResidualThreshold: Float = 0.01
+    @Published var maxNewPerDensify: Int = 512
+    @Published var minAgeForPrune: Int = 50
+    @Published var minOpacityForSplit: Float = 0.05
+    @Published var maxOpacityForSplit: Float = 0.7
+    @Published var jitterFrac: Float = 0.3
+    @Published var lastDensifyStats: (added: Int, pruned: Int) = (0,0)
+    private var ages: [Int] = [] // age in optimizer steps
+    var residualTexture: MTLTexture
+    // Ground-truth frame uploaded (linear RGBA16F) for fused GPU loss
+    var gtTexture: MTLTexture?
+    var gaussians: [GaussianParam]
+    var gaussianBuffer: MTLBuffer
+    var gradBuffers: MetalRenderer.GradBuffers?
     private var originalPositions: [SIMD3<Float>] = [] // store unscaled PLY positions
     // SH L1 linear coefficients per gaussian (RGB each has [x,y,z])
     private var shR1: [SIMD3<Float>] = []
@@ -59,8 +78,8 @@ final class Trainer: ObservableObject {
     private var vScaleZ: [Float] = []
 
     // Optimizer state (Adam)
-    private var m: [GaussianParam] // first moment per param (only for color, opacity, sigma, position simplified)
-    private var v: [GaussianParam] // second moment
+    private var m: [GaussianParam] = [] // first moment per param (only for color, opacity, sigma, position simplified)
+    private var v: [GaussianParam] = [] // second moment
     // Adam moments for SH L1 coefficients
     private var mShR1: [SIMD3<Float>] = []
     private var vShR1: [SIMD3<Float>] = []
@@ -106,11 +125,15 @@ final class Trainer: ObservableObject {
     @Published var autoFrontPct: Float = 0
 
     private var timer: Timer?
-    private var zSign: Float = -1.0
+    var zSign: Float = -1.0
     private var zeroFramesStreak: Int = 0
     private var frameHoldCounter: Int = 0
     private var currentFrameIndex: Int = 0
     private var lossEMA: Float = 0
+    // Интервал генерации превью (PNG) для снижения накладных расходов UI
+    private let previewInterval: Int = 10
+    // Интервал логирования производственных метрик
+    private let perfLogInterval: Int = 20
     @Published var overlayEnabled: Bool = true
     @Published var plyScale: Float = 1.0
     @Published var flipX: Bool = false
@@ -123,9 +146,51 @@ final class Trainer: ObservableObject {
     @Published var enableSHL2: Bool = false
     private var didLogSHL2Enable: Bool = false
     private var globalGradClipNorm: Float = 5.0
+    // Robust loss (Charbonnier) controls
+    @Published var enableCharbonnierLoss: Bool = false {
+        didSet { renderer.enableCharbonnierLoss = enableCharbonnierLoss }
+    }
+    // Screen-space cache toggle for backward pass (reuses per-gaussian projection & covariance)
+    @Published var useScreenCache: Bool = true
+    // Forward screen-space cache toggle (reuses projection in forward pass)
+    @Published var useForwardCache: Bool = true {
+        didSet { renderer.enableForwardCache = useForwardCache }
+    }
+    // Exposure control & diagnostics
+    @Published var exposureWarmupIters: Int = 50 // freeze auto-gain first N iterations (stabilize colors)
+    @Published var exposureLogging: Bool = true // per-iteration gain logging
+    @Published var exposureEnabled: Bool = true // master toggle (if false, gain=1 always)
+    private var lastExposureGain: Float = 1.0
+
+    // (Removed duplicate early performDensifyPrune; single implementation kept later in file.)
+
+    // Manual trigger from UI
+    func performManualDensify() {
+        performDensifyPrune()
+    }
+    @Published var charbEps: Float = 1e-3 {
+        didSet { renderer.charbEps = max(1e-6, min(1e-1, charbEps)) }
+    }
+    // Mini-batch (multi-frame gradient accumulation) placeholder settings
+    @Published var batchSizeFrames: Int = 1 { // when >1 we will accumulate grads before Adam
+        didSet {
+            let clamped = max(1, min(32, batchSizeFrames))
+            if clamped != batchSizeFrames { // prevent recursion
+                batchSizeFrames = clamped
+                return
+            }
+            // If user changed value (even if clamp kept same), reset accumulators to avoid mixing scales
+            if oldValue != batchSizeFrames {
+                batchAccumulated = 0
+                batchLossSum = 0
+            }
+        }
+    }
+    private var batchAccumulated: Int = 0 // number of frames accumulated in current batch (future use)
+    private var batchLossSum: Float = 0
     // Read-only view for UI to know current camera forward sign
     var isCameraForwardPlusZ: Bool { zSign > 0 }
-    private func log(_ msg: String) {
+    func log(_ msg: String) {
         print("[Trainer] \(msg)")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -134,10 +199,36 @@ final class Trainer: ObservableObject {
         }
     }
 
-    private func checkSHL2ActivationLog() {
+    func checkSHL2ActivationLog() {
         if enableSHL2 && !didLogSHL2Enable {
             didLogSHL2Enable = true
             log("SH L2 включён: 9 гармоник на канал (27 цветовых коэффициентов, было 4/канал)")
+        }
+    }
+
+    init() {
+        // We assume device is always available on iOS 17+ devices running this app; fatalError if not.
+        guard let dev = MTLCreateSystemDefaultDevice() else {
+            fatalError("Metal device not available")
+        }
+        device = dev
+        guard let r = MetalRenderer(device: dev) else {
+            fatalError("Failed to initialize MetalRenderer pipeline(s)")
+        }
+        renderer = r
+        // Dataset lazy init
+        dataset = DatasetManager()
+        gaussians = []
+        gaussianBuffer = dev.makeBuffer(length: 1, options: .storageModeShared)! // placeholder, will be rebuilt
+    // Allocate initial textures using dataset dimensions (avoid lingering 16x16 placeholder that causes gray preview)
+    residualTexture = renderer.makeTexture(width: dataset.width, height: dataset.height) ?? renderer.makeTexture(width: 16, height: 16)!
+    targetTexture = renderer.makeTexture(width: dataset.width, height: dataset.height) ?? renderer.makeTexture(width: 16, height: 16)!
+        // Defer forward cache flag sync until after all stored properties initialized
+        renderer.enableForwardCache = useForwardCache
+        // Initialize a default gaussian cloud if empty
+        if gaussians.isEmpty {
+            // Choose a modest default count; can be overridden by UI later
+            setGaussianCount(2048)
         }
     }
 
@@ -236,21 +327,25 @@ final class Trainer: ObservableObject {
                 gs.append(GaussianParam(position: pos, sigma: sigma, color: color, opacity: opacity))
             }
         } else {
-            // Fallback: random cloud near origin
+            // Fallback: random cloud but force in front of camera for visibility
             gs.reserveCapacity(gaussianCount)
             var rng = SystemRandomNumberGenerator()
+            let depthScale: Float = 2.5
             for _ in 0..<gaussianCount {
-                let pos = SIMD3<Float>(Float.random(in: -1...1, using: &rng),
+                var pos = SIMD3<Float>(Float.random(in: -1...1, using: &rng),
                                        Float.random(in: -1...1, using: &rng),
                                        Float.random(in: -1...1, using: &rng))
-                let sigma: Float = Float.random(in: 0.02...0.08, using: &rng)
-                let color = SIMD3<Float>(Float.random(in: 0...1, using: &rng), Float.random(in: 0...1, using: &rng), Float.random(in: 0...1, using: &rng))
-                let opacity: Float = Float.random(in: 0.05...0.5, using: &rng)
+                // Camera looks along -Z (zSign = -1) ⇒ put points at negative z
+                pos.z = -abs(pos.z) * depthScale - 0.5
+                let sigma: Float = Float.random(in: 0.025...0.06, using: &rng)
+                let color = SIMD3<Float>(Float.random(in: 0.25...0.85, using: &rng), Float.random(in: 0.25...0.85, using: &rng), Float.random(in: 0.25...0.85, using: &rng))
+                let opacity: Float = Float.random(in: 0.25...0.55, using: &rng)
                 gs.append(GaussianParam(position: pos, sigma: sigma, color: color, opacity: opacity))
             }
         }
         self.gaussians = gs
     self.originalPositions = gs.map { $0.position }
+        self.ages = Array(repeating: 0, count: gs.count)
         self.m = Array(repeating: GaussianParam(position: .zero, sigma: 0, color: .zero, opacity: 0), count: gs.count)
         self.v = self.m
         // Initialize SH L1 arrays and their optimizer moments
@@ -330,7 +425,7 @@ final class Trainer: ObservableObject {
             if let r2e2 = ckpt.shR2_ex2, r2e2.count == n { self.shR2_ex2 = r2e2 } else { self.shR2_ex2 = Array(repeating: .zero, count: n) }
             if let g2e1 = ckpt.shG2_ex1, g2e1.count == n { self.shG2_ex1 = g2e1 } else { self.shG2_ex1 = Array(repeating: .zero, count: n) }
             if let g2e2 = ckpt.shG2_ex2, g2e2.count == n { self.shG2_ex2 = g2e2 } else { self.shG2_ex2 = Array(repeating: .zero, count: n) }
-            if let b2e1 = ckpt.shB2_ex1, b2e1.count == n { self.shB2_ex1 = b2e1 } else { self.shB2_ex1 = Array(repeating: .zero, count: n) }
+            if let b2e1 = ckpt.shB2_ex1, b2e1.count == n { self.shB2_ex1 = b2e1 }
             if let b2e2 = ckpt.shB2_ex2, b2e2.count == n { self.shB2_ex2 = b2e2 } else { self.shB2_ex2 = Array(repeating: .zero, count: n) }
             self.mShR2_ex1 = self.shR2_ex1; self.vShR2_ex1 = self.shR2_ex1
             self.mShR2_ex2 = self.shR2_ex2; self.vShR2_ex2 = self.shR2_ex2
@@ -344,6 +439,7 @@ final class Trainer: ObservableObject {
             self.vScaleX = self.mScaleX
             self.vScaleY = self.mScaleX
             self.vScaleZ = self.mScaleX
+            self.ages = Array(repeating: 0, count: n)
             self._syncGaussiansToGPU()
             log("Loaded checkpoint at iter=\(iteration), gaussians=\(gaussians.count)")
         } else {
@@ -725,30 +821,33 @@ final class Trainer: ObservableObject {
                                            Float.random(in: -1...1, using: &rng),
                                            Float.random(in: -1...1, using: &rng))
                     let sigma: Float = Float.random(in: 0.02...0.08, using: &rng)
-                    let color = SIMD3<Float>(Float.random(in: 0...1, using: &rng),
-                                              Float.random(in: 0...1, using: &rng),
-                                              Float.random(in: 0...1, using: &rng))
+                    let color = SIMD3<Float>(Float.random(in: 0...1, using: &rng), Float.random(in: 0...1, using: &rng), Float.random(in: 0...1, using: &rng))
                     let opacity: Float = Float.random(in: 0.05...0.5, using: &rng)
                     gs.append(GaussianParam(position: pos, sigma: sigma, color: color, opacity: opacity))
                 }
                 log("PLY had fewer points (\(pts.count)) than requested (\(count)); filled with random to reach target count.")
             }
         } else {
-            // Fully random fallback
+            // Fully random fallback (ensuring points appear in front of camera for immediate visibility)
             gs.reserveCapacity(count)
             var rng = SystemRandomNumberGenerator()
+            let depthScale: Float = 2.5
             for _ in 0..<count {
-                let pos = SIMD3<Float>(Float.random(in: -1...1, using: &rng),
+                var pos = SIMD3<Float>(Float.random(in: -1...1, using: &rng),
                                        Float.random(in: -1...1, using: &rng),
                                        Float.random(in: -1...1, using: &rng))
-                let sigma: Float = Float.random(in: 0.02...0.08, using: &rng)
-                let color = SIMD3<Float>(Float.random(in: 0...1, using: &rng),
-                                          Float.random(in: 0...1, using: &rng),
-                                          Float.random(in: 0...1, using: &rng))
-                let opacity: Float = Float.random(in: 0.05...0.5, using: &rng)
+                // Camera assumed to look along -Z; push splats into negative z range slightly farther than unit cube for consistent coverage
+                pos.z = -abs(pos.z) * depthScale - 0.5
+                let sigma: Float = Float.random(in: 0.025...0.06, using: &rng)
+                // Restrict initial colors to mid-range to avoid washed out or too dark composites; later optimization will expand dynamic range
+                let color = SIMD3<Float>(Float.random(in: 0.25...0.85, using: &rng),
+                                         Float.random(in: 0.25...0.85, using: &rng),
+                                         Float.random(in: 0.25...0.85, using: &rng))
+                // Moderate opacity range to ensure meaningful early accumulation without over-saturation
+                let opacity: Float = Float.random(in: 0.25...0.55, using: &rng)
                 gs.append(GaussianParam(position: pos, sigma: sigma, color: color, opacity: opacity))
             }
-            log("No PLY found; created random cloud of \(count) gaussians.")
+            log("No PLY found; created front-of-camera random cloud of \(count) gaussians.")
         }
 
         self.gaussians = gs
@@ -895,6 +994,13 @@ final class Trainer: ObservableObject {
         let sortedGPU = items.map { GaussianParamGPU($0.g) }
     // Create a temporary buffer for rendering only
         guard let tmpBuf = renderer.makeBuffer(array: sortedGPU) else { return nil }
+        // Ensure target texture matches dataset dims; reallocate if mismatch (e.g. user switched to original resolution after placeholder)
+        if targetTexture.width != dataset.width || targetTexture.height != dataset.height {
+            if let newTex = renderer.makeTexture(width: dataset.width, height: dataset.height) {
+                targetTexture = newTex
+                if renderer.debugLogging { print("[TrainerDiag] Reallocated targetTexture to \(dataset.width)x\(dataset.height) (was \(targetTexture.width)x\(targetTexture.height))") }
+            }
+        }
         renderer.forward(gaussiansBuffer: tmpBuf, gaussianCount: gaussians.count, worldToCam: W2C, intrinsics: s.intr, target: targetTexture, pointScale: 800.0, zSign: zSign, enableSHL2: enableSHL2)
         return renderer.cgImage(from: targetTexture)
     }
@@ -1051,6 +1157,9 @@ final class Trainer: ObservableObject {
     }
 
     private func computeLossAndGradients(pred: CGImage, gt: UIImage) -> Float {
+    // NOTE: This legacy CPU path is retained as fallback. If residualTexture already
+    // contains gain*pred - gt from fused GPU path in current iteration, caller should
+    // avoid calling this method.
     // L2 loss between pred and GT + local gradients for color/opacity (and optional position cues)
         guard let gtCG = gt.cgImage else { return 0 }
         let w = pred.width, h = pred.height
@@ -1176,7 +1285,7 @@ final class Trainer: ObservableObject {
             memset(gbufs.sX.contents(), 0, gbufs.sX.length)
             memset(gbufs.sY.contents(), 0, gbufs.sY.length)
             memset(gbufs.sZ.contents(), 0, gbufs.sZ.length)
-            renderer.backward(gaussiansBuffer: gaussianBuffer, gaussianCount: gaussians.count, worldToCam: W2C, intrinsics: s.intr, residual: residualTexture, grads: gbufs, zSign: zSign, enableSHL2: enableSHL2)
+            renderer.backward(gaussiansBuffer: gaussianBuffer, gaussianCount: gaussians.count, worldToCam: W2C, intrinsics: s.intr, residual: residualTexture, grads: gbufs, zSign: zSign, enableSHL2: enableSHL2, enableCache: useScreenCache)
         }
 
         // Read back grads (fixed-point scaled by 1024) and normalize
@@ -1196,7 +1305,7 @@ final class Trainer: ObservableObject {
         var sXGrads = Array(repeating: Float(0), count: gaussians.count)
         var sYGrads = Array(repeating: Float(0), count: gaussians.count)
         var sZGrads = Array(repeating: Float(0), count: gaussians.count)
-        let norm: Float = 1.0 / 1024.0 / Float(max(1, w*h))
+    let norm: Float = 1.0 / 1024.0 / Float(max(1, w*h)) / Float(max(1, batchSizeFrames))
         if let gbufs = gradBuffers {
             let n = gaussians.count
             let gr = gbufs.c0R.contents().bindMemory(to: Int32.self, capacity: n)
@@ -1422,6 +1531,7 @@ final class Trainer: ObservableObject {
                 stepP.y = max(-posStepClip, min(posStepClip, stepP.y))
                 stepP.z = max(-posStepClip, min(posStepClip, stepP.z))
                 g.position -= stepP
+                renderer.markGaussiansDirty()
             }
             shG1[i] = clamp3(shG1[i], -1.0, 1.0)
             shB1[i] = clamp3(shB1[i], -1.0, 1.0)
@@ -1774,24 +1884,104 @@ final class Trainer: ObservableObject {
 
     private func step() {
         guard isTraining else { return }
+        // Sync robust loss flags each tick (in case changed just before step)
+        renderer.enableCharbonnierLoss = enableCharbonnierLoss
+        renderer.charbEps = charbEps
     // Hold the same frame for a few steps to stabilize gradients
         if frameHoldCounter <= 0 {
             currentFrameIndex = (currentFrameIndex + 1) % dataset.samples.count
             frameHoldCounter = frameHold
         }
         let sampleIndex = currentFrameIndex
+        // Render prediction to targetTexture
         guard let predCG = renderPrediction(for: sampleIndex) else { return }
-        let gt = dataset.samples[sampleIndex].image
-        let loss = computeLossAndGradients(pred: predCG, gt: gt)
-        // Update EMA loss for logging
+        // Upload GT if needed (linear half)
+        let gtImg = dataset.samples[sampleIndex].image
+        renderer.uploadGTImage(gtImg, existing: &gtTexture, width: dataset.width, height: dataset.height)
+        var loss: Float = 0
+        var exposureOverride: Float? = nil
+        if !exposureEnabled { exposureOverride = 1.0 }
+        else if iteration < exposureWarmupIters { exposureOverride = lastExposureGain } // freeze at latest
+        if let gtTex = gtTexture, let fused = renderer.fusedExposureResidualLoss(pred: targetTexture, gt: gtTex, residual: residualTexture, overrideGain: exposureOverride) {
+            // Reuse existing gradient pipeline reading residualTexture; need CGImage for preview only (predCG already produced)
+            loss = fused.loss
+            lastExposureGain = fused.gain
+            if exposureLogging {
+                if iteration % 1 == 0 { // every iteration, cheap string
+                    log(String(format: "exposure gain=%.4f %@", fused.gain, (exposureOverride != nil ? "(override)" : "")))
+                }
+            }
+            // Build residual heatmap (downsampled) for upcoming densification (if enabled later)
+            if residualHeatmapTexture == nil { residualHeatmapTexture = nil } // placeholder ensure symbol exists
+            if let heat = renderer.buildResidualHeatmap(residual: residualTexture, existing: &residualHeatmapTexture, factor: 4) {
+                lastHeatmapBuildFrame = iteration
+                _ = heat // stored in residualHeatmapTexture for later use
+            }
+            // Run backward with residualTexture
+            let s = dataset.samples[currentFrameIndex]
+            let W2C = worldToCamMatrix(extr: s.extr)
+            if gradBuffers == nil || (gradBuffers!.c0R.length / MemoryLayout<UInt32>.stride) != gaussians.count {
+                gradBuffers = renderer.makeGradBuffers(count: gaussians.count)
+            }
+            if let gbufs = gradBuffers {
+                if batchAccumulated == 0 {
+                    let group1 = [gbufs.c0R, gbufs.c0G, gbufs.c0B]
+                    let group2 = [gbufs.r1x, gbufs.r1y, gbufs.r1z, gbufs.g1x, gbufs.g1y, gbufs.g1z]
+                    let group3 = [gbufs.b1x, gbufs.b1y, gbufs.b1z, gbufs.r2, gbufs.g2, gbufs.b2]
+                    let group4 = [gbufs.opacity, gbufs.sigma, gbufs.posX, gbufs.posY, gbufs.posZ, gbufs.sX, gbufs.sY, gbufs.sZ]
+                    for buf in group1 { memset(buf.contents(), 0, buf.length) }
+                    for buf in group2 { memset(buf.contents(), 0, buf.length) }
+                    for buf in group3 { memset(buf.contents(), 0, buf.length) }
+                    for buf in group4 { memset(buf.contents(), 0, buf.length) }
+                }
+                if gaussians.isEmpty {
+                    if renderer.debugLogging { print("[Trainer] Skip backward: gaussianCount == 0") }
+                } else {
+                    if renderer.debugLogging {
+                        let lrInfo = String(format: "lr=%.4g", lr)
+                        print("[Trainer] Dispatch backward gaussians=\(gaussians.count) batchAccumulated=\(batchAccumulated)/\(batchSizeFrames) useCache=\(useScreenCache) tiled=\(renderer.useTiledBackward) \(lrInfo)")
+                    }
+                    renderer.backward(gaussiansBuffer: gaussianBuffer, gaussianCount: gaussians.count, worldToCam: W2C, intrinsics: s.intr, residual: residualTexture, grads: gbufs, zSign: zSign, enableSHL2: enableSHL2, enableCache: useScreenCache)
+                    // Gradient diagnostics (simple CPU reduction) for first few iterations & periodically
+                    if iteration < 200 || iteration % 500 == 0 {
+                        gradientDiagnostics(gbufs: gbufs)
+                    }
+                }
+            }
+            // Continue with existing gradient readback & Adam update logic by faking paths below.
+        } else {
+            // Fallback CPU path (in case pipelines missing)
+            let gt = gtImg
+            loss = computeLossAndGradients(pred: predCG, gt: gt)
+        }
+        // Accumulate batch loss
+        batchLossSum += loss
+        // Update EMA each frame for responsiveness
         lossEMA = (lossEMA == 0) ? loss : (0.95 * lossEMA + 0.05 * loss)
+
+        let finishingBatch = (batchAccumulated + 1) >= batchSizeFrames
+        if !finishingBatch {
+            batchAccumulated += 1
+            // Skip gradient readback / updates until batch complete
+            frameHoldCounter -= 1
+            return
+        }
+        // Average loss over batch (for logging & history)
+        loss = batchLossSum / Float(batchAccumulated + 1)
+        batchLossSum = 0
+        batchAccumulated = 0
 
         // Sync updated gaussians to GPU
         _syncGaussiansToGPU()
 
-        iteration += 1
+    iteration += 1 // count optimizer steps, not individual frames when batching
+        // Update ages
+        for i in 0..<ages.count { ages[i] += 1 }
+        if enableDensification, iteration % densifyInterval == 0 {
+            performDensifyPrune()
+        }
         frameHoldCounter -= 1
-        if iteration % 5 == 0 {
+    if iteration % 5 == 0 {
             // Average opacity for debugging collapse
             let avgOpacity = gaussians.reduce(0.0) { $0 + $1.opacity } / Float(max(1, gaussians.count))
             let stats = computeImageStats(predCG)
@@ -1937,15 +2127,21 @@ final class Trainer: ObservableObject {
                     lastReseedIteration = iteration
                 }
             }
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.lossHistory.append(loss)
-                if let png = UIImage(cgImage: predCG).pngData() {
-                    self.previewImageData = png
+            if iteration % previewInterval == 0 {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.lossHistory.append(loss)
+                    if let png = UIImage(cgImage: predCG).pngData() {
+                        self.previewImageData = png
+                    }
+                    if self.overlayEnabled, let ov = self.makeOverlay(for: sampleIndex), let pngOv = UIImage(cgImage: ov).pngData() {
+                        self.overlayImageData = pngOv
+                    }
                 }
-                // Overlay preview (optional)
-                if self.overlayEnabled, let ov = self.makeOverlay(for: sampleIndex), let pngOv = UIImage(cgImage: ov).pngData() {
-                    self.overlayImageData = pngOv
+            } else {
+                // Только метаданные без обновления PNG
+                DispatchQueue.main.async { [weak self] in
+                    self?.lossHistory.append(loss)
                 }
             }
             let diag = reprojectionDiagnostics(for: sampleIndex)
@@ -1958,9 +2154,67 @@ final class Trainer: ObservableObject {
                        variance, gaussVar, chroma.meanSat,
                        diag.front, 100.0 * Float(diag.front) / Float(max(1, diag.total)),
                        diag.inBounds, 100.0 * Float(diag.inBounds) / Float(max(1, diag.total))))
+            if iteration % perfLogInterval == 0 {
+                let fms = renderer.lastForwardMS
+                let bms = renderer.lastBackwardMS
+                let tms = renderer.lastTileBuildMS
+                let fc = renderer.lastForwardCacheBuildMS
+                let (hits, misses, rate) = renderer.forwardCacheStats()
+                log(String(format: "perf: forward=%.2fms backward=%.2fms tile=%.2fms fCacheBuild=%.2fms cacheHits=%d cacheMisses=%d cacheHitRate=%.1f%%", fms, bms, tms, fc, hits, misses, rate * 100.0))
+            }
         }
 
         if iteration % 200 == 0 { saveCheckpoint() }
+    }
+
+    // MARK: - Gradient Diagnostics
+    private func gradientDiagnostics(gbufs: MetalRenderer.GradBuffers) {
+        let n = gaussians.count
+        guard n > 0 else { return }
+        struct Stat { var sum: Float = 0; var sum2: Float = 0; var maxAbs: Float = 0; var zeros: Int = 0 }
+        func reduce(_ buf: MTLBuffer, stat: inout Stat) {
+            let ptr = buf.contents().bindMemory(to: Float.self, capacity: max(n,1))
+            for i in 0..<n { let v = ptr[i]; stat.sum += v; stat.sum2 += v*v; if abs(v) > stat.maxAbs { stat.maxAbs = abs(v) }; if v == 0 { stat.zeros += 1 } }
+        }
+        func finalize(_ s: Stat) -> (rms: Float, maxAbs: Float, zeroFrac: Float) {
+            let rms = sqrt(max(0, s.sum2 / Float(n)))
+            return (rms, s.maxAbs, Float(s.zeros)/Float(n))
+        }
+        var c0R=Stat(), c0G=Stat(), c0B=Stat(), opacityS=Stat(), sigmaS=Stat(), px=Stat(), py=Stat(), pz=Stat(), sx=Stat(), sy=Stat(), sz=Stat()
+        reduce(gbufs.c0R, stat: &c0R); reduce(gbufs.c0G, stat: &c0G); reduce(gbufs.c0B, stat: &c0B)
+        reduce(gbufs.opacity, stat: &opacityS); reduce(gbufs.sigma, stat: &sigmaS)
+        reduce(gbufs.posX, stat: &px); reduce(gbufs.posY, stat: &py); reduce(gbufs.posZ, stat: &pz)
+        reduce(gbufs.sX, stat: &sx); reduce(gbufs.sY, stat: &sy); reduce(gbufs.sZ, stat: &sz)
+        // SH L1 groups
+        var r1x=Stat(), r1y=Stat(), r1z=Stat(), g1x=Stat(), g1y=Stat(), g1z=Stat(), b1x=Stat(), b1y=Stat(), b1z=Stat()
+        reduce(gbufs.r1x, stat: &r1x); reduce(gbufs.r1y, stat: &r1y); reduce(gbufs.r1z, stat: &r1z)
+        reduce(gbufs.g1x, stat: &g1x); reduce(gbufs.g1y, stat: &g1y); reduce(gbufs.g1z, stat: &g1z)
+        reduce(gbufs.b1x, stat: &b1x); reduce(gbufs.b1y, stat: &b1y); reduce(gbufs.b1z, stat: &b1z)
+        // SH L2 if enabled (packed 6 coeff segments per channel). We'll compute combined RMS across all 6 for each channel.
+        func reduceL2(_ buf: MTLBuffer, label: String) -> (Float, Float, Float) {
+            // length = 6 * n * sizeof(Float) (stored as UInt32 length originally). We treat as Float.
+            let total = 6 * n
+            let ptr = buf.contents().bindMemory(to: Float.self, capacity: max(total,1))
+            var sum2: Float = 0; var maxAbs: Float = 0; var zeros: Int = 0
+            for i in 0..<total { let v = ptr[i]; sum2 += v*v; if abs(v) > maxAbs { maxAbs = abs(v) }; if v==0 { zeros += 1 } }
+            let rms = sqrt(max(0, sum2 / Float(total)))
+            return (rms, maxAbs, Float(zeros)/Float(total))
+        }
+        let l2R = enableSHL2 ? reduceL2(gbufs.r2, label: "r2") : nil
+        let l2G = enableSHL2 ? reduceL2(gbufs.g2, label: "g2") : nil
+        let l2B = enableSHL2 ? reduceL2(gbufs.b2, label: "b2") : nil
+        // Assemble concise log line
+        let fmt = { (x: Float) -> String in String(format: "%.2e", x) }
+        let line = String(format: "grad RMS c0=(%@,%@,%@) op=%@ sig=%@ pos=(%@,%@,%@) s=(%@,%@,%@) r1x=%@ r1y=%@ r1z=%@ g1x=%@ g1y=%@ g1z=%@ b1x=%@ b1y=%@ b1z=%@%@",
+                          fmt(finalize(c0R).rms), fmt(finalize(c0G).rms), fmt(finalize(c0B).rms),
+                          fmt(finalize(opacityS).rms), fmt(finalize(sigmaS).rms),
+                          fmt(finalize(px).rms), fmt(finalize(py).rms), fmt(finalize(pz).rms),
+                          fmt(finalize(sx).rms), fmt(finalize(sy).rms), fmt(finalize(sz).rms),
+                          fmt(finalize(r1x).rms), fmt(finalize(r1y).rms), fmt(finalize(r1z).rms),
+                          fmt(finalize(g1x).rms), fmt(finalize(g1y).rms), fmt(finalize(g1z).rms),
+                          fmt(finalize(b1x).rms), fmt(finalize(b1y).rms), fmt(finalize(b1z).rms),
+                          enableSHL2 ? String(format: " l2R=%@ l2G=%@ l2B=%@", fmt(l2R!.0), fmt(l2G!.0), fmt(l2B!.0)) : "")
+        log(line)
     }
 
     private func computeImageStats(_ image: CGImage) -> (meanRGB: SIMD3<Float>, nonBlackRatio: Float) {
@@ -2039,3 +2293,112 @@ final class Trainer: ObservableObject {
         log("Reseeded colors from multi-frames count=\(frames.count), blend=\(alpha)")
     }
 }
+
+// MARK: - Densification (split & prune) implementation
+extension Trainer {
+    fileprivate func performDensifyPrune() {
+        guard enableDensification else { return }
+        guard let heat = residualHeatmapTexture else {
+            log("[Densify] Skipped: no residual heatmap yet")
+            return
+        }
+        let startCount = gaussians.count
+        if ages.count != startCount { ages = Array(repeating: 0, count: startCount) }
+        let maxTotal = 120_000
+        if startCount >= maxTotal { log("[Densify] At capacity (\(startCount)) -> prune only") }
+
+        let w = heat.width, h = heat.height
+        var residualVals = [Float](repeating: 0, count: w*h)
+        // Copy RGBA16F texture to CPU and read first component as residual magnitude
+        do {
+            let bytesPerPixel = 8 // 4 * Float16
+            let rowStride = w * bytesPerPixel
+            var tmp = [UInt8](repeating: 0, count: rowStride * h)
+            heat.getBytes(&tmp, bytesPerRow: rowStride, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+            tmp.withUnsafeBytes { raw in
+                let ptr = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
+                let compsPerPixel = 4
+                for i in 0..<(w*h) {
+                    let hVal = ptr[i * compsPerPixel]
+                    residualVals[i] = Float(Float16(bitPattern: hVal))
+                }
+            }
+        }
+
+        // Sample residual heat per gaussian using current frame projection (approx)
+        var scores = [Float](repeating: 0, count: gaussians.count)
+        if !dataset.samples.isEmpty {
+            let sf = dataset.samples[currentFrameIndex % dataset.samples.count]
+            let W2C = worldToCamMatrix(extr: sf.extr)
+            let scaleXHeat = Float(w) / Float(dataset.width)
+            let scaleYHeat = Float(h) / Float(dataset.height)
+            for i in 0..<gaussians.count {
+                let g = gaussians[i]
+                let cam4 = W2C * SIMD4<Float>(g.position, 1)
+                let cam = SIMD3<Float>(cam4.x, cam4.y, cam4.z)
+                let zf: Float = (zSign < 0) ? (-cam.z) : (cam.z)
+                if zf <= 0 { continue }
+                let u = sf.intr.fx * (cam.x / zf) + sf.intr.cx
+                let v = sf.intr.fy * (cam.y / zf) + sf.intr.cy
+                if u < 0 || v < 0 || u >= Float(dataset.width) || v >= Float(dataset.height) { continue }
+                let hx = Int(u * scaleXHeat)
+                let hy = Int(v * scaleYHeat)
+                if hx >= 0 && hy >= 0 && hx < w && hy < h {
+                    scores[i] = residualVals[hy * w + hx]
+                }
+            }
+        }
+
+        var toAdd: [GaussianParam] = []
+        var addAges: [Int] = []
+        var prunedMask = Array(repeating: false, count: gaussians.count)
+        var rng = SystemRandomNumberGenerator()
+        var added = 0
+        for i in 0..<gaussians.count {
+            let g = gaussians[i]
+            let age = (i < ages.count) ? ages[i] : 0
+            let score = scores[i]
+            // Prune: old, low opacity, low residual
+            if age >= minAgeForPrune && g.opacity < pruneOpacityThreshold && score < lowResidualThreshold {
+                prunedMask[i] = true
+                continue
+            }
+            // Split: high residual mid-opacity
+            if startCount + added < maxTotal && added < maxNewPerDensify && score > splitThreshold && g.opacity >= minOpacityForSplit && g.opacity <= maxOpacityForSplit {
+                let baseSigma = g.sigma
+                let jitter = baseSigma * max(0.05, min(1.0, jitterFrac))
+                let dir = normalize(SIMD3<Float>(Float.random(in: -1...1, using: &rng), Float.random(in: -1...1, using: &rng), Float.random(in: -1...1, using: &rng)))
+                let c1 = GaussianParam(position: g.position + dir * jitter, sigma: baseSigma * 0.7, color: g.color, opacity: g.opacity * 0.6)
+                let c2 = GaussianParam(position: g.position - dir * jitter, sigma: baseSigma * 0.7, color: g.color, opacity: g.opacity * 0.6)
+                toAdd.append(contentsOf: [c1,c2])
+                addAges.append(contentsOf: [0,0])
+                gaussians[i].opacity *= 0.5
+                gaussians[i].sigma = baseSigma * 0.9
+                added += 2
+            }
+        }
+
+        if prunedMask.contains(true) || !toAdd.isEmpty {
+            var newG: [GaussianParam] = []
+            var newA: [Int] = []
+            newG.reserveCapacity(gaussians.count - prunedMask.filter{$0}.count + toAdd.count)
+            for i in 0..<gaussians.count {
+                if prunedMask[i] { continue }
+                newG.append(gaussians[i])
+                newA.append( (i < ages.count) ? ages[i] : 0 )
+            }
+            newG.append(contentsOf: toAdd)
+            newA.append(contentsOf: addAges)
+            let pruned = prunedMask.filter{$0}.count
+            gaussians = newG
+            ages = newA
+            lastDensifyStats = (added: toAdd.count, pruned: pruned)
+            _syncGaussiansToGPU()
+            log("[Densify] added=\(toAdd.count) pruned=\(pruned) total=\(gaussians.count) start=\(startCount)")
+        } else {
+            lastDensifyStats = (0,0)
+            log("[Densify] No changes")
+        }
+    }
+}
+
